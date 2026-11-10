@@ -1,0 +1,26 @@
+# Secrets
+.env*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Downloaded model files
+*.onnx
+*.bin
+*.safetensors
+*.pt
+models/
+.cache/
+
+# Console mode recordings
+console-recordings/
+
+# Tooling
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.log
+.DS_Store

@@ -1,0 +1,48 @@
+# Unit prices and free-tier limits used to ESTIMATE call costs and usage in Talkbalt.
+#
+# All prices in USD. Values researched 2026-10 from each provider's pricing page; re-check them
+# from time to time. Talkbalt never fetches prices or usage from the providers; everything here is
+# your own configuration, and every cost it shows is an estimate. A value left as "TODO" is
+# treated as unknown and left out of estimates.
+#
+#   Groq:      https://groq.com/pricing
+#   Deepgram:  https://deepgram.com/pricing
+#   LiveKit:   https://livekit.com/pricing
+
+# --- LLM (Groq), per 1 million tokens (source: groq.com/pricing, 2026-10) ----------------------
+# Cached input tokens are billed at a discount; reasoning tokens are part of output.
+[llm."openai/gpt-oss-20b"]
+input_per_million = 0.075
+cached_input_per_million = 0.037
+output_per_million = 0.30
+
+[llm."openai/gpt-oss-120b"]
+input_per_million = 0.15
+cached_input_per_million = 0.075
+output_per_million = 0.60
+
+# --- Speech-to-text (Deepgram streaming, monolingual) (source: deepgram.com/pricing, 2026-10) ----
+# 0.0048 is a promotional rate; the regular rate is 0.0077 per minute.
+[stt."nova-3"]
+per_minute = 0.0048
+
+# --- Text-to-speech (Deepgram Aura-2), per 1,000 characters (source: deepgram.com/pricing, 2026-10)
+[tts."aura-2"]
+per_1k_characters = 0.030
+
+# --- LiveKit (source: livekit.com/pricing, 2026-10) ----------------------------------------------
+[livekit]
+inbound_phone_per_minute = 0.01     # LiveKit Phone Number, US local inbound
+egress_audio_per_minute = 0.005     # audio-only egress (recordings)
+
+# --- Free tiers / monthly allowances (used by the usage meters) ---------------------------------
+[free_tier]
+deepgram_credit_usd = 200           # one-time Deepgram credit
+livekit_inbound_minutes = 50        # Build plan, per month
+livekit_egress_minutes = 60         # Build plan transcode minutes, per month
+
+# Groq free tier for openai/gpt-oss-20b and openai/gpt-oss-120b (source: console.groq.com/docs/rate-limits,
+# 2026-10). Cached tokens do not count toward these limits. The per-minute limits (30 requests,
+# 8,000 tokens) are handled live by agent/groq_client.py; the daily ones feed the usage meters.
+groq_requests_per_day = 1000
+groq_tokens_per_day = 200000

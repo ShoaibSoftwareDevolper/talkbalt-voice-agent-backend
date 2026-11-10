@@ -1,0 +1,17 @@
+[project]
+name = "talkbalt-backend"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.1",
+    "asyncpg>=0.32.0",
+    "boto3>=1.43.117",
+    "fastapi>=0.159.1",
+    "livekit-agents[deepgram,groq,silero]~=1.8",
+    "livekit-api>=1.2.2",
+    "livekit-plugins-ai-coustics>=0.3.5",
+    "livekit-plugins-krisp>=0.4.8",
+    "python-dotenv>=1.2.4",
+    "sqlalchemy[asyncio]>=2",
+    "uvicorn[standard]>=0.54.0",
+]
