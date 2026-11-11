@@ -1,17 +1,31 @@
 [project]
-name = "talkbalt-backend"
+name = "talkbalt-voice-agent"
 version = "0.1.0"
+description = "Talkbalt voice agent (LiveKit Agents): answers calls for each business through the platform API."
 requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.20.1",
     "asyncpg>=0.32.0",
-    "boto3>=1.43.117",
-    "fastapi>=0.159.1",
     "livekit-agents[deepgram,groq,silero]~=1.8",
     "livekit-api>=1.2.2",
     "livekit-plugins-ai-coustics>=0.3.5",
-    "livekit-plugins-krisp>=0.4.8",
     "python-dotenv>=1.2.4",
+    "redis>=8.1.0",
     "sqlalchemy[asyncio]>=2",
-    "uvicorn[standard]>=0.54.0",
 ]
+
+[tool.uv]
+# Never resolve packages published in the last two weeks (supply-chain safety).
+exclude-newer = "2026-10-28T00:00:00Z"
+
+[tool.pyrefly]
+# The agent runs as `uv run agent/agent.py`, so its modules import each other from agent/.
+search-path = ["agent"]
+
+[tool.ruff]
+line-length = 120
+src = ["agent"]
+
+[tool.ruff.lint]
+select = ["F", "E", "W", "B", "I", "UP", "SIM"]
+ignore = ["E501"]

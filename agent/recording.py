@@ -1,12 +1,42 @@
 """Call recording with LiveKit Egress: one mixed audio-only OGG per room, uploaded to R2."""
 
 import logging
+import os
 from dataclasses import dataclass
 
 from livekit import api
-from storage import R2Config, recording_key
 
 logger = logging.getLogger("talkbalt-agent")
+
+
+@dataclass(frozen=True)
+class R2Config:
+    """Cloudflare R2 (S3-compatible) bucket the egress uploads to. The platform API has its own
+    copy of these settings to hand out playback links."""
+
+    endpoint: str
+    access_key_id: str
+    secret_access_key: str
+    bucket: str
+
+    @classmethod
+    def from_env(cls) -> "R2Config | None":
+        """From R2_ENDPOINT (or R2_ACCOUNT_ID), R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET; None if any is missing."""
+        endpoint = os.getenv("R2_ENDPOINT", "").strip().rstrip("/")
+        if not endpoint and (account_id := os.getenv("R2_ACCOUNT_ID", "").strip()):
+            endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+        values = {
+            "endpoint": endpoint,
+            "access_key_id": os.getenv("R2_ACCESS_KEY_ID", "").strip(),
+            "secret_access_key": os.getenv("R2_SECRET_ACCESS_KEY", "").strip(),
+            "bucket": os.getenv("R2_BUCKET", "").strip(),
+        }
+        return cls(**values) if all(values.values()) else None
+
+
+def recording_key(room_name: str) -> str:
+    """Object key of a room's recording; the platform API presigns this key for playback."""
+    return f"recordings/{room_name}.ogg"
 
 
 @dataclass

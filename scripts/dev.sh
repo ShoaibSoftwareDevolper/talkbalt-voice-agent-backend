@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# Runs the whole backend for development: Postgres container, API (port 8001) and the agent worker.
-# Ctrl+C stops the API and the agent; the Postgres container keeps running.
+# Runs the voice agent for development: its own Postgres and Redis containers, its migrations, and
+# the LiveKit agent worker. The platform API (platform-api/scripts/dev.sh) must be running too.
 #
-# Usage (from anywhere):  backend-web/scripts/dev.sh
+# First time only:
+#   PG_CONTAINER=talkbalt-voice-postgres PG_VOLUME=talkbalt-voice-pgdata PG_DB=talkbalt_voice \
+#     PG_URL_VAR=VOICE_DATABASE_URL bash scripts/setup_docker_db.sh
+#   bash scripts/setup_docker_redis.sh talkbalt-voice-redis 6383
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-docker start talkbalt-postgres >/dev/null
+docker start talkbalt-voice-postgres talkbalt-voice-redis >/dev/null
 uv run alembic upgrade head
-
-uv run uvicorn api.main:app --port 8001 --reload &
-api=$!
-uv run agent/agent.py dev &
-agent=$!
-
-trap 'kill $api $agent 2>/dev/null; wait' INT TERM EXIT
-wait -n
+exec uv run agent/agent.py dev

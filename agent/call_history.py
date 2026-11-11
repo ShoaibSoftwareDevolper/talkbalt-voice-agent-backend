@@ -1,21 +1,22 @@
-"""Call history: one `calls` row per call, created at start and finalized at session end.
+"""Call history: the call is registered with the platform API when it starts, and its full report
+(transcript, per-turn metrics, events, usage totals) is sent once at session end.
 
-Database problems are logged and swallowed; they must never affect the call itself.
+Platform problems are logged and swallowed; they must never affect the call itself. A report the
+platform can't take waits in the voice database's outbox (see platform_client).
 """
 
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from statistics import mean
 from typing import Any
 
-from db import Call, CallEvent, CallTurnMetric, database_configured, session_scope
 from livekit.agents import CloseEvent, ConversationItemAddedEvent
 from livekit.agents.llm import ChatMessage
 from livekit.agents.metrics import LLMMetrics, STTMetrics, TTSMetrics
-from pricing import estimate_call_cost
-from sqlalchemy import update
+
+import platform_client
 
 logger = logging.getLogger("talkbalt-agent")
 
@@ -49,29 +50,17 @@ def turn_metrics(item: ChatMessage) -> dict[str, int | None]:
 
 
 def _ts(epoch: float | None) -> datetime | None:
-    return datetime.fromtimestamp(epoch, timezone.utc) if epoch else None
-
-
-def mask_phone_number(number: str | None) -> str | None:
-    digits = "".join(c for c in number or "" if c.isdigit())
-    return f"***{digits[-4:]}" if len(digits) >= 4 else None
+    return datetime.fromtimestamp(epoch, UTC) if epoch else None
 
 
 class CallTracker:
-    def __init__(
-        self,
-        *,
-        room_name: str,
-        call_type: str,
-        llm_model: str,
-        caller_number: str | None,
-        recording_status: str,
-    ) -> None:
+    call_type = "web"  # every call comes from a browser: dashboard, public link or widget
+
+    def __init__(self, *, room_name: str, org_id: uuid.UUID, llm_model: str, recording_status: str) -> None:
         self.room_name = room_name
-        self.call_type = call_type
+        self.org_id = org_id
         self.llm_model = llm_model
-        self.caller_number_masked = mask_phone_number(caller_number) if call_type == "phone" else None
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
 
         self.recording_status = recording_status
         self.recording_key: str | None = None
@@ -82,8 +71,9 @@ class CallTracker:
         self.close_reason: str | None = None
         self.transcript: list[dict[str, Any]] = []
 
-        self.call_id: uuid.UUID | None = None
-        self._insert_task: asyncio.Task[None] | None = None
+        # Chosen here, so bookings made during the call can reference it right away.
+        self.call_id = uuid.uuid4()
+        self._start_task: asyncio.Task[None] | None = None
 
         # Metrics buffered in memory and written once at session end (never on the audio path).
         # LLM and TTS metrics queue up until the agent message they produced is added, so a tool
@@ -98,7 +88,7 @@ class CallTracker:
 
     def add_event(self, type_: str, detail: str | None = None) -> None:
         """Records a notable event. `detail` must never contain caller content."""
-        self.events.append({"timestamp": datetime.now(timezone.utc), "type": type_, "detail": (detail or "")[:255] or None})
+        self.events.append({"timestamp": datetime.now(UTC), "type": type_, "detail": (detail or "")[:255] or None})
 
     def on_llm_metrics(self, m: LLMMetrics) -> None:
         self._pending_llm.append(m)
@@ -156,29 +146,30 @@ class CallTracker:
         )
         return row
 
-    def start(self) -> None:
-        """Inserts the row in the background so the greeting isn't delayed."""
-        if not database_configured():
-            logger.info("call history disabled: DATABASE_URL not set")
-            return
-        self._insert_task = asyncio.create_task(self._insert())
+    def _start_payload(self) -> dict[str, Any]:
+        return {
+            "id": str(self.call_id),
+            "room_name": self.room_name,
+            "call_type": self.call_type,
+            "llm_model": self.llm_model,
+            "org_id": str(self.org_id),
+            "recording_status": self.recording_status,
+            "started_at": self.started_at.isoformat(),
+        }
 
-    async def _insert(self) -> None:
-        call = Call(
-            room_name=self.room_name,
-            call_type=self.call_type,
-            started_at=self.started_at,
-            llm_model=self.llm_model,
-            recording_status=self.recording_status,
-            caller_number_masked=self.caller_number_masked,
-        )
+    def start(self) -> None:
+        """Registers the call in the background so the greeting isn't delayed."""
+        if not platform_client.configured():
+            logger.info("call history disabled: PLATFORM_API_URL or INTERNAL_API_TOKEN not set")
+            return
+        self._start_task = asyncio.create_task(self._register())
+
+    async def _register(self) -> None:
         try:
-            async with session_scope() as db:
-                db.add(call)
-            self.call_id = call.id
-            logger.info("call history: row created id=%s", call.id)
-        except Exception as e:
-            logger.warning("call history: could not create row (%s)", e)
+            await platform_client.start_call(self._start_payload())
+            logger.info("call history: registered id=%s", self.call_id)
+        except Exception:
+            pass  # the final report re-registers it
 
     def on_item_added(self, ev: ConversationItemAddedEvent) -> None:
         if not isinstance(ev.item, ChatMessage) or ev.item.role not in ("user", "assistant"):
@@ -193,7 +184,7 @@ class CallTracker:
             {
                 "role": "user" if ev.item.role == "user" else "agent",
                 "text": text,
-                "timestamp": datetime.fromtimestamp(ev.item.created_at, timezone.utc).isoformat(),
+                "timestamp": datetime.fromtimestamp(ev.item.created_at, UTC).isoformat(),
                 "metrics": turn_metrics(ev.item),
                 # True when the caller talked over the agent; `text` is then only what was spoken.
                 "interrupted": bool(ev.item.interrupted),
@@ -216,62 +207,37 @@ class CallTracker:
         }
 
     async def finalize(self) -> None:
-        """Writes the end of the call. Called from on_session_end, which runs for every ending."""
-        if self._insert_task is not None:
-            await self._insert_task
-        if self.call_id is None:
+        """Sends the call's report. Called from on_session_end, which runs for every ending."""
+        if self._start_task is None:
             return
+        await self._start_task
 
-        ended_at = datetime.now(timezone.utc)
+        ended_at = datetime.now(UTC)
         end_reason = self.end_reason or _CLOSE_REASONS.get(self.close_reason or "", "unknown")
-        duration = round((ended_at - self.started_at).total_seconds(), 1)
-        tot = self.totals
-        cost, breakdown = estimate_call_cost(
-            llm_model=self.llm_model,
-            prompt_tokens=tot["prompt"],
-            cached_tokens=tot["cached"],
-            completion_tokens=tot["completion"],
-            stt_audio_seconds=tot["stt_seconds"],
-            tts_characters=tot["tts_characters"],
-            duration_seconds=duration,
-            call_type=self.call_type,
-            recorded=self.recording_status in ("recording", "processing", "completed"),
-        )
-        values = {
-            "ended_at": ended_at,
-            "duration_seconds": duration,
+
+        def jsonable(row: dict[str, Any]) -> dict[str, Any]:
+            return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in row.items()}
+
+        report = {
+            "ended_at": ended_at.isoformat(),
+            "duration_seconds": round((ended_at - self.started_at).total_seconds(), 1),
             "end_reason": end_reason,
-            "turn_count": sum(1 for entry in self.transcript if entry["role"] == "user"),
             "transcript": self.transcript,
             "recording_status": self.recording_status,
             "recording_key": self.recording_key,
             "egress_id": self.egress_id,
-            **self._averages(),
-            "total_prompt_tokens": tot["prompt"],
-            "total_cached_tokens": tot["cached"],
-            "total_completion_tokens": tot["completion"],
-            "total_reasoning_tokens": tot["reasoning"],
-            "llm_requests": tot["llm_requests"],
-            "total_stt_audio_seconds": round(tot["stt_seconds"], 2),
-            "total_tts_characters": tot["tts_characters"],
-            "total_tts_audio_seconds": round(tot["tts_seconds"], 2),
-            "cache_hit_ratio": round(tot["cached"] / tot["prompt"], 4) if tot["prompt"] else None,
-            "estimated_cost_usd": cost,
-            "cost_breakdown": breakdown,
+            "averages": self._averages(),
+            "totals": self.totals,
+            "turns": [jsonable(t) for t in self.turns],
+            "events": [jsonable(e) for e in self.events],
         }
         try:
-            async with session_scope() as db:
-                await db.execute(update(Call).where(Call.id == self.call_id).values(**values))
-                db.add_all(CallTurnMetric(call_id=self.call_id, **row) for row in self.turns)
-                db.add_all(CallEvent(call_id=self.call_id, **ev) for ev in self.events)
+            delivered = await platform_client.report_call(self.call_id, {"start": self._start_payload(), "report": report})
             logger.info(
-                "call history: row finalized id=%s end_reason=%s turns=%s metrics_rows=%s events=%s recording=%s",
-                self.call_id,
-                end_reason,
-                values["turn_count"],
-                len(self.turns),
-                len(self.events),
-                self.recording_status,
+                "call history: report %s id=%s end_reason=%s turns=%s events=%s recording=%s",
+                "delivered" if delivered else "queued in the outbox",
+                self.call_id, end_reason, len(self.turns), len(self.events), self.recording_status,
             )
+            await platform_client.flush_outbox()
         except Exception as e:
-            logger.warning("call history: could not finalize row %s (%s)", self.call_id, e)
+            logger.warning("call history: could not report call %s (%s)", self.call_id, type(e).__name__)

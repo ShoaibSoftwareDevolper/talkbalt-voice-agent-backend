@@ -1,30 +1,11 @@
-"""Date, time and opening hours for the agent's instructions (computed once per call)."""
+"""Understanding days and times callers say, checking them against the business's opening hours,
+and the per-call business context for the agent's instructions."""
 
-import os
 import re
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-_DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-
-def parse_hours(spec: str) -> dict[int, tuple[time, time]]:
-    """'Mon-Sat 10:00-20:00' (entries separated by ',' or ';') -> {weekday: (open, close)}.
-
-    Days not listed are closed.
-    """
-    hours: dict[int, tuple[time, time]] = {}
-    for entry in re.split(r"[;,]", spec):
-        m = re.fullmatch(r"\s*([a-z]{3})(?:\s*-\s*([a-z]{3}))?\s+(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})\s*", entry.lower())
-        if not m:
-            raise ValueError(f"cannot parse BUSINESS_HOURS entry {entry!r} (expected e.g. 'Mon-Sat 10:00-20:00')")
-        first = _DAYS.index(m[1])
-        last = _DAYS.index(m[2]) if m[2] else first
-        span = (time(int(m[3]), int(m[4])), time(int(m[5]), int(m[6])))
-        for day in range(first, last + 1):
-            hours[day] = span
-    return hours
-
+from tenant import Business, current_business
 
 _WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 _MONTHS = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"]
@@ -41,13 +22,18 @@ DAY_OR_TIME_WORDS = re.compile(
 )
 
 
+def _business() -> Business:
+    business = current_business.get()
+    assert business is not None, "a call always runs for a business"
+    return business
+
+
 def business_now() -> datetime:
-    tz = ZoneInfo(os.getenv("BUSINESS_TIMEZONE", "Asia/Karachi").strip() or "Asia/Karachi")
-    return datetime.now(tz)
+    return datetime.now(ZoneInfo(_business().timezone))
 
 
 def business_hours() -> dict[int, tuple[time, time]]:
-    return parse_hours(os.getenv("BUSINESS_HOURS", "Mon-Sat 10:00-20:00"))
+    return _business().hours
 
 
 def _number_words(text: str) -> str:
@@ -137,8 +123,9 @@ def check_day(day: datetime, now: datetime) -> str | None:
     return None
 
 
-def check_time(day: datetime | None, times: list[time], now: datetime) -> tuple[bool, str]:
-    """(ok, explanation) for the requested time on `day` (or any open day when the day is unknown)."""
+def check_time(day: datetime | None, times: list[time], now: datetime) -> tuple[bool, str, time | None]:
+    """(ok, explanation, accepted time) for the requested time on `day` (or any open day when the
+    day is unknown)."""
     hours = business_hours()
     span = hours.get(day.weekday()) if day else None
     spans = [span] if span else list(hours.values())
@@ -146,11 +133,11 @@ def check_time(day: datetime | None, times: list[time], now: datetime) -> tuple[
         if any(open_ <= t < close for open_, close in spans):
             if day and day.date() == now.date() and t <= now.time():
                 continue
-            return True, _clock(t)
-    asked = " or ".join(_clock(t) for t in times)
+            return True, clock(t), t
+    asked = " or ".join(clock(t) for t in times)
     if span:
-        return False, f"{asked} is outside opening hours ({_clock(span[0])} to {_clock(span[1])}) or has already passed"
-    return False, f"{asked} is outside opening hours"
+        return False, f"{asked} is outside opening hours ({clock(span[0])} to {clock(span[1])}) or has already passed", None
+    return False, f"{asked} is outside opening hours", None
 
 
 def nearest_open_days(now: datetime, after: datetime | None = None, count: int = 2) -> str:
@@ -166,7 +153,7 @@ def nearest_open_days(now: datetime, after: datetime | None = None, count: int =
     return " or ".join(found)
 
 
-def _clock(t: time | datetime) -> str:
+def clock(t: time | datetime) -> str:
     return t.strftime("%I:%M %p").lstrip("0").replace(":00 ", " ")
 
 
@@ -175,10 +162,11 @@ def format_date(d: datetime) -> str:
 
 
 def business_context(now: datetime | None = None) -> str:
-    """The per-call part of the instructions. Kept separate and last so the static instructions
-    before it stay an identical prefix across calls (Groq caches exact prefixes)."""
+    """The per-call part of the instructions. It goes after the static instructions, so those stay an
+    identical prefix across calls for Groq's prompt cache."""
+    business = _business()
     now = now or business_now()
-    hours = business_hours()
+    hours = business.hours
 
     today = hours.get(now.weekday())
     if today is None:
@@ -186,26 +174,37 @@ def business_context(now: datetime | None = None) -> str:
     elif now.time() >= today[1]:
         today_status = "already closed for today"
     elif now.time() >= today[0]:
-        today_status = f"open now until {_clock(today[1])}"
+        today_status = f"open now until {clock(today[1])}"
     else:
-        today_status = f"opens today at {_clock(today[0])}"
+        today_status = f"opens today at {clock(today[0])}"
 
     def day_entry(offset: int) -> str:
         day = now + timedelta(days=offset)
         span = hours.get(day.weekday())
-        label = f"{day:%a} {day.day} {day:%b}"
-        if offset == 1:
-            label = f"tomorrow {label}"
-        if span is None:
-            return f"{label} closed"
-        return f"{label} {_clock(span[0])}-{_clock(span[1])}"
+        label = f"{'tomorrow ' if offset == 1 else ''}{day:%a} {day.day} {day:%b}"
+        return f"{label} {clock(span[0])}-{clock(span[1])}" if span else f"{label} closed"
 
-    return (
-        f"Right now it is {format_date(now)} {now.year}, {_clock(now)} ({now.tzinfo}); {today_status}.\n"
-        f"Opening hours for the coming days: {'; '.join(day_entry(i) for i in range(1, 8))}.\n"
-        "Only accept appointment times on open days, within opening hours (an appointment must start before "
-        "closing time), and not in the past. If the caller "
-        "asks for a closed day, a time outside opening hours, or a past time, say so briefly and suggest the "
-        "nearest open time. Use the dates above for words like tomorrow or next Tuesday, and always say a date "
-        "with its weekday, for example Friday, 24 October."
-    )
+    lines = [f"You answer calls for {business.name}; introduce yourself as its receptionist."]
+    if business.about:
+        lines[0] += f" About the business: {business.about.strip()}"
+    lines.append(business.location())
+    if business.services:
+        lines.append(f"Bookable services: {'; '.join(s.describe() for s in business.services)}. Answer questions about services from this list only.")
+    else:
+        lines.append("You do not have the list of services or prices. If asked, say a team member can share the details, and offer to take a message.")
+    if business.products:
+        lines.append(f"Products for sale (callers can ask, not book): {'; '.join(p.describe(with_duration=False) for p in business.products)}.")
+    contact = "; ".join(f"{k}: {v}" for k, v in (("website", business.website), ("email", business.contact_email)) if v)
+    if contact:
+        lines.append(f"Contact details you may share: {contact}.")
+    if business.faqs:
+        lines.append("Answers to common questions (use them, in your own words): " + " ".join(f"Q: {q} A: {a}" for q, a in business.faqs))
+    lines += [
+        f"Right now it is {format_date(now)} {now.year}, {clock(now)} ({now.tzinfo}); {today_status}.",
+        f"Opening hours for the coming days: {'; '.join(day_entry(i) for i in range(1, 8))}.",
+        "Only accept appointment times on open days, within opening hours (an appointment must start before closing "
+        "time), and not in the past. If the caller asks for a closed day, a time outside opening hours, or a past time, "
+        "say so briefly and suggest the nearest open time. Use the dates above for words like tomorrow or next Tuesday, "
+        "and always say a date with its weekday, for example Friday, 24 October.",
+    ]
+    return "\n".join(lines)

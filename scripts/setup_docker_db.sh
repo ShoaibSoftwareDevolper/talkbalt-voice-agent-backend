@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # Local Postgres for Talkbalt in Docker, no sudo needed (idempotent).
 #
-# Starts container "talkbalt-postgres" (postgres:18, named volume, restart unless-stopped,
-# bound to 127.0.0.1 on the first free port from 5433), with user and database "talkbalt" and a
-# random password, and writes DATABASE_URL into backend-web/.env.local (that line only).
-# If the container already exists it is reused (started if stopped). Secrets are never printed.
-# Run from anywhere:  bash backend-web/scripts/setup_docker_db.sh
+# Starts a Postgres container (postgres:18, named volume, restart unless-stopped, bound to
+# 127.0.0.1 on the first free port from 5433) with a random password, and writes its URL into
+# .env.local (that line only). If the container already exists it is reused (started if stopped).
+# Secrets are never printed.
+#
+# Defaults are the platform database; override for another service, e.g. the voice agent:
+#   PG_CONTAINER=talkbalt-voice-postgres PG_VOLUME=talkbalt-voice-pgdata PG_DB=talkbalt_voice \
+#   PG_URL_VAR=VOICE_DATABASE_URL bash scripts/setup_docker_db.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 ENV_FILE=".env.local"
-CONTAINER="talkbalt-postgres"
-VOLUME="talkbalt-pgdata"
+CONTAINER="${PG_CONTAINER:-talkbalt-postgres}"
+VOLUME="${PG_VOLUME:-talkbalt-pgdata}"
 IMAGE="postgres:18"
 DB_USER="talkbalt"
-DB_NAME="talkbalt"
+DB_NAME="${PG_DB:-talkbalt}"
+URL_VAR="${PG_URL_VAR:-DATABASE_URL}"
+export URL_VAR
 
 container_env() {
   # One environment value from the container's config (used to rebuild DATABASE_URL).
@@ -60,7 +65,7 @@ done
 echo
 docker exec "$CONTAINER" pg_isready -U "$DB_USER" -d "$DB_NAME" -q || { echo "Postgres did not become ready." >&2; exit 1; }
 
-# DATABASE_URL from the container's own settings, so a reused container needs nothing stored elsewhere.
+# The URL from the container's own settings, so a reused container needs nothing stored elsewhere.
 host_port=$(docker port "$CONTAINER" 5432/tcp | grep -o '127.0.0.1:[0-9]*' | head -1 | cut -d: -f2)
 user=$(container_env POSTGRES_USER)
 password=$(container_env POSTGRES_PASSWORD)
@@ -68,15 +73,16 @@ db=$(container_env POSTGRES_DB)
 url="postgresql://${user}:${password}@127.0.0.1:${host_port}/${db}"
 unset password
 
-# Replace (or append) only the DATABASE_URL line.
+# Replace (or append) only the URL line.
+touch "$ENV_FILE"
 tmp=$(mktemp)
-grep -v '^DATABASE_URL=' "$ENV_FILE" > "$tmp" || true
+grep -v "^${URL_VAR}=" "$ENV_FILE" > "$tmp" || true
 if [[ -s "$tmp" && -n "$(tail -c1 "$tmp")" ]]; then echo >> "$tmp"; fi
-printf 'DATABASE_URL=%s\n' "$url" >> "$tmp"
+printf '%s=%s\n' "$URL_VAR" "$url" >> "$tmp"
 cat "$tmp" > "$ENV_FILE"
 rm -f "$tmp"
 unset url
-echo "Wrote DATABASE_URL to ${ENV_FILE} (port ${host_port})."
+echo "Wrote ${URL_VAR} to ${ENV_FILE} (port ${host_port})."
 
 # Verify with the app's credentials over TCP, the way the app connects.
 uv run python - <<'PY'
@@ -88,7 +94,7 @@ import asyncpg
 load_dotenv(Path(".env.local"))
 
 async def main() -> None:
-    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    conn = await asyncpg.connect(os.environ[os.environ["URL_VAR"]])
     row = await conn.fetchrow("SELECT current_user, current_database(), current_setting('server_version') AS v")
     await conn.close()
     print(f"Connection check passed: {row['current_user']} @ {row['current_database']} (Postgres {row['v']})")
