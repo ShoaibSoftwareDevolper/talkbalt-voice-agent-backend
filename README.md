@@ -61,7 +61,17 @@ scripts/dev.sh                  # containers, migrations, agent worker
 | `VOICE_DATABASE_URL`, `REDIS_URL` | The agent's own Postgres and Redis (written by the setup scripts) |
 | `R2_*`, `RECORDING_ENABLED` | Call recordings (audio-only egress to Cloudflare R2) |
 | `LLM_MODEL` | Optional, default `openai/gpt-oss-20b` |
+| `TTS_MODEL` | Optional, default `cartesia/sonic-3.6`, through LiveKit Inference |
 | `LOG_TRANSCRIPTS` | Optional, default `true`; `false` strips what callers said from SDK logs |
+
+## Languages
+
+Each business chooses in its dashboard which language its receptionist speaks (English, Urdu or
+Hindi) and its voice (`agent/voices.py`; samples in the frontend's `public/voices/`). Callers are
+understood in all three either way: STT is Deepgram Nova-3 with `language="multi"` and keyterms (the
+business, service and product names), which writes Hindi and spoken Urdu in Devanagari. Each reply
+is spoken in the language its script shows (`Receptionist.tts_node`). The booking checks match a glossed copy of each message, with Urdu and
+Hindi keywords read as English (`agent/lang.py`), and Devanagari names are saved in Latin letters.
 
 ## Resilience
 

@@ -24,6 +24,7 @@ from livekit.agents import (
     llm,
     room_io,
 )
+from livekit.agents import tts as agents_tts
 from livekit.agents.llm import LLMError
 from livekit.agents.metrics import LLMMetrics
 from livekit.plugins import ai_coustics, deepgram, groq, silero
@@ -34,6 +35,7 @@ from pipeline_events import PipelinePublisher
 from receptionist import Receptionist
 from recording import final_recording_status, start_recording
 from tenant import Business, current_business, load_business, org_id_from_metadata
+from voices import voice_for
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env.local")
 
@@ -42,6 +44,11 @@ logger.setLevel(logging.INFO)
 
 AGENT_NAME = "talkbalt-agent"
 LLM_MODEL = os.getenv("LLM_MODEL", "").strip() or "openai/gpt-oss-20b"
+# Speech in English, Urdu and Hindi. STT: Deepgram Nova-3 in multilingual mode (English and Hindi with
+# code-switching; spoken Urdu comes out as Hindi, which the agent reads fine), so callers are understood
+# in all three. TTS: Cartesia Sonic 3.6 through LiveKit Inference (no extra API key), in the language
+# and voice the business chose in its dashboard (voices.py).
+TTS_MODEL = os.getenv("TTS_MODEL", "").strip() or "cartesia/sonic-3.6"
 # Bounds runaway replies. gpt-oss reasoning tokens count toward it (~160 at reasoning_effort=low).
 MAX_COMPLETION_TOKENS = 256
 LOG_TRANSCRIPTS = os.getenv("LOG_TRANSCRIPTS", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -162,8 +169,16 @@ async def run_session(ctx: JobContext, business: Business) -> None:
         tracker.on_llm_metrics(m)
         pipeline.on_llm_metrics(m)
 
-    stt = deepgram.STT(model="nova-3", language="en")
-    tts = deepgram.TTS(model="aura-2-asteria-en")
+    # Keyterms bias recognition toward the words this caller is most likely to need heard right.
+    keyterms = [business.name, *(s.name for s in business.services), *(p.name for p in business.products)]
+    # Urdu businesses get Deepgram's Urdu model, which writes Urdu script (the multilingual model writes
+    # Urdu speech as Hindi, and sometimes guesses other scripts). Hindi and English use the multilingual
+    # model, which follows callers switching between Hindi and English. Both take keyterms.
+    stt = deepgram.STT(model="nova-3", language="ur" if business.language == "ur" else "multi", keyterm=keyterms[:50])
+    speech = inference.TTS(model=TTS_MODEL, voice=voice_for(business.voice).cartesia_id, language=business.language)
+    # If LiveKit Inference can't speak (outage, or the plan's inference credit is used up), Deepgram
+    # Aura takes over: English only, but never a silent call.
+    tts = agents_tts.FallbackAdapter([speech, deepgram.TTS(model="aura-2-asteria-en")])
     stt.on("metrics_collected", tracker.on_stt_metrics)
     tts.on("metrics_collected", tracker.on_tts_metrics)
 
@@ -188,7 +203,7 @@ async def run_session(ctx: JobContext, business: Business) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=Receptionist(business, tracker),
+        agent=Receptionist(business, tracker, speech),
         room_options=room_io.RoomOptions(
             # A closing session hangs up instead of leaving the caller in silence.
             delete_room_on_close=True,

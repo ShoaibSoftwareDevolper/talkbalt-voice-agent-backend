@@ -47,6 +47,8 @@ class Business:
     website: str | None = None
     contact_email: str | None = None
     faqs: tuple[tuple[str, str], ...] = ()
+    language: str = "en"  # what the receptionist speaks: en | ur | hi
+    voice: str = "kiara"  # a key in voices.VOICES
 
     def location(self) -> str:
         """Where the business serves customers, as one sentence for the agent."""
@@ -100,4 +102,7 @@ async def load_business(org_id: uuid.UUID) -> Business | None:
         website=runtime["website"],
         contact_email=runtime["contact_email"],
         faqs=tuple((f["q"], f["a"]) for f in runtime["faqs"]),
+        # .get: a last-good copy cached before these settings existed has neither.
+        language=runtime.get("language") or "en",
+        voice=runtime.get("voice") or "kiara",
     )

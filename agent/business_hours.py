@@ -186,14 +186,27 @@ def business_context(now: datetime | None = None) -> str:
 
     lines = [f"You answer calls for {business.name}; introduce yourself as its receptionist."]
     if business.about:
-        lines[0] += f" About the business: {business.about.strip()}"
+        lines[0] += (
+            " Background about the business, for context only (it may mention things that are not offered, so never use it "
+            f"as the list of services, products or prices): {business.about.strip()}"
+        )
     lines.append(business.location())
     if business.services:
-        lines.append(f"Bookable services: {'; '.join(s.describe() for s in business.services)}. Answer questions about services from this list only.")
+        lines.append(
+            f"The only bookable services are: {'; '.join(s.describe() for s in business.services)}. When a caller asks what "
+            "you offer, name exactly these and nothing else. Never name, describe, offer or book any other service, even one "
+            "the background mentions."
+        )
     else:
-        lines.append("You do not have the list of services or prices. If asked, say a team member can share the details, and offer to take a message.")
+        lines.append(
+            "No bookable services are listed, so you cannot book appointments. Do not name or describe any services, not even "
+            "ones the background mentions. If asked, say a team member can share the details, and offer to take a message."
+        )
     if business.products:
-        lines.append(f"Products for sale (callers can ask, not book): {'; '.join(p.describe(with_duration=False) for p in business.products)}.")
+        lines.append(
+            f"The only products for sale (callers can ask about them, not book them): "
+            f"{'; '.join(p.describe(with_duration=False) for p in business.products)}. Never mention any other product."
+        )
     contact = "; ".join(f"{k}: {v}" for k, v in (("website", business.website), ("email", business.contact_email)) if v)
     if contact:
         lines.append(f"Contact details you may share: {contact}.")

@@ -15,7 +15,8 @@ import time
 from collections.abc import AsyncIterable
 from typing import Any
 
-from livekit.agents import Agent, ModelSettings, RunContext, llm, utils
+from livekit import rtc
+from livekit.agents import Agent, ModelSettings, RunContext, llm, tts, utils
 from livekit.agents.beta.tools import EndCallTool
 from livekit.agents.llm import ChatItem, ChatMessage, Toolset
 
@@ -24,7 +25,9 @@ from bookings import BookingResult, book, booking_note, requested
 from business_hours import business_context
 from call_history import CallTracker
 from groq_client import rate_limit
+from lang import gloss, script_language
 from tenant import Business
+from voices import voice_for
 
 logger = logging.getLogger("talkbalt-agent")
 
@@ -51,7 +54,39 @@ The system may add call notes before your reply: what is collected, what is miss
 Follow them, and never ask again for a detail they list as collected. Read phone numbers digit by digit in small groups,
 exactly as the notes give them, never formatted with dashes or as hundreds and thousands."""
 
-GREETING_INSTRUCTIONS = "Greet the caller warmly, say the business name, introduce yourself as its receptionist, and ask how you can help."
+# The language the business chose for its receptionist. Callers are understood in all three either way.
+LANGUAGE_RULES = {
+    "en": "This receptionist speaks only English. Write every reply in English, whatever language the caller uses.",
+    "ur": "This receptionist speaks only Urdu. Write every reply in Urdu, in Urdu script (never Roman Urdu, never Devanagari), "
+          "whatever language the caller uses. Keep service and product names as they are written. Say numbers, prices and "
+          "times the way an Urdu speaker says them.",
+    "hi": "This receptionist speaks only Hindi. Write every reply in Hindi, in Devanagari (never Roman Hindi, never Urdu "
+          "script), whatever language the caller uses. Keep service and product names as they are written. Say numbers, "
+          "prices and times the way a Hindi speaker says them.",
+}
+# Callers who speak another language are still understood, but told once which language this line uses.
+OTHER_LANGUAGE_RULE = (
+    "If the caller speaks a language other than {language} (for example {others}), you still understand them: the first "
+    "time it happens, kindly tell them in one short sentence, in {language}, that this line is only in {language}; then "
+    "answer what they asked, in {language}. Do not repeat that notice later in the call."
+)
+# The business writes its details (about, FAQs, address) in whichever language is easiest for it;
+# they are facts to pass on, and are always spoken in the receptionist's language.
+BUSINESS_INFO_RULE = (
+    "The business details below may be written in English, Urdu or Hindi. They are facts, not wording to read out: "
+    "always say them in {language}, in your own natural words."
+)
+_OTHERS = {"en": "Urdu or Hindi", "ur": "English or Hindi", "hi": "English or Urdu"}
+_PLAIN_NAMES = {"en": "English", "ur": "Urdu", "hi": "Hindi"}
+SPEAKER = {
+    "female": "You speak as a woman: in Urdu and Hindi use feminine forms for yourself (for example sakti hoon, karti hoon).",
+    "male": "You speak as a man: in Urdu and Hindi use masculine forms for yourself (for example sakta hoon, karta hoon).",
+}
+LANGUAGE_NAMES = {"en": "English", "ur": "Urdu, in Urdu script", "hi": "Hindi, in Devanagari"}
+
+GREETING_INSTRUCTIONS = (
+    "Greet the caller warmly in {language}, say the business name, introduce yourself as its receptionist, and ask how you can help."
+)
 
 # Added to EndCallTool's built-in description.
 END_CALL_WHEN = """Call it only when the caller clearly wants to finish: they say goodbye, bye, that's all, that's everything
@@ -67,7 +102,12 @@ END_CALL_BLOCKED = (
     "briefly invite them to go on."
 )
 
-RATE_LIMIT_NOTICE = "One moment please. "
+# Said while a Groq rate-limit wait holds up the reply, in the receptionist's language.
+RATE_LIMIT_NOTICE = {
+    "en": "Just a moment, please. ",
+    "ur": "براہِ مہربانی ایک لمحہ انتظار کیجیے۔ ",
+    "hi": "कृपया एक पल रुकिए। ",
+}
 
 # The caller's latest message clearly ends the call (English, plus Urdu closings as STT spells them).
 _FINISHED = re.compile(
@@ -83,7 +123,7 @@ _ASKED_ANYTHING_ELSE = re.compile(r"\b(anything|something) (else|more)\b")
 
 
 def _normalize(text: str) -> str:
-    return text.lower().replace("’", "'").strip(" \t\n.,!?")
+    return gloss(text).strip(" \t\n.,!?")
 
 
 def caller_finished(items: list[ChatItem]) -> tuple[bool, str]:
@@ -120,7 +160,7 @@ class GuardedEndCallTool(EndCallTool):
 
 
 class OneQuestionFilter:
-    """Cuts a streaming reply after its first question mark, or its first line break once text was
+    """Cuts a streaming reply after its first question mark (Latin or Urdu "؟"), or its first line break once text was
     written. gpt-oss sometimes keeps going with more questions or the caller's answers; a normal
     spoken reply never needs either, so it passes through unchanged."""
 
@@ -135,8 +175,8 @@ class OneQuestionFilter:
             self.dropped += delta
             return ""
         for i, char in enumerate(delta):
-            if char == "?" or (char == "\n" and self.kept.strip()):
-                end = i + 1 if char == "?" else i  # the question mark itself is spoken
+            if char in "?؟" or (char == "\n" and self.kept.strip()):
+                end = i + 1 if char in "?؟" else i  # the question mark itself is spoken
                 self.cut = True
                 self.kept += delta[i:end]
                 self.dropped += delta[end:]
@@ -146,7 +186,7 @@ class OneQuestionFilter:
 
 
 class Receptionist(Agent):
-    def __init__(self, business: Business, tracker: CallTracker) -> None:
+    def __init__(self, business: Business, tracker: CallTracker, speech: tts.TTS | None = None) -> None:
         end_call = GuardedEndCallTool(
             tracker,
             extra_description=END_CALL_WHEN,
@@ -155,8 +195,18 @@ class Receptionist(Agent):
             ignore_on_enter=True,  # can't hang up during the greeting
             on_tool_called=self._on_end_call,
         )
-        super().__init__(instructions=f"{INSTRUCTIONS}\n\n{business_context()}", tools=end_call.tools)
+        language = business.language if business.language in LANGUAGE_RULES else "en"
+        speaker = SPEAKER[voice_for(business.voice).gender]
+        other = OTHER_LANGUAGE_RULE.format(language=_PLAIN_NAMES[language], others=_OTHERS[language])
+        info = BUSINESS_INFO_RULE.format(language=_PLAIN_NAMES[language])
+        super().__init__(
+            instructions=f"{INSTRUCTIONS}\n\n{LANGUAGE_RULES[language]} {other} {speaker} {info}\n\n{business_context()}",
+            tools=end_call.tools,
+        )
+        self._language = language
         self._business = business
+        self._speech = speech
+        self._speech_language = language
         self._tracker = tracker
         self._started = time.monotonic()
         self._booking: BookingResult | None = None
@@ -166,11 +216,14 @@ class Receptionist(Agent):
         logger.info("ending call after goodbye, duration=%.1fs", time.monotonic() - self._started)
 
     async def on_enter(self) -> None:
-        # The business's own greeting is spoken word for word, with no LLM request.
-        if self._business.greeting:
-            self.session.say(self._business.greeting)
+        # The business's own greeting is spoken word for word, with no LLM request, when it is written in
+        # the receptionist's language; otherwise the receptionist greets in its own words, so the call
+        # never starts in one language and continues in another.
+        greeting = self._business.greeting
+        if greeting and script_language(greeting) in (self._language, None):
+            self.session.say(greeting)
         else:
-            self.session.generate_reply(instructions=GREETING_INSTRUCTIONS)
+            self.session.generate_reply(instructions=GREETING_INSTRUCTIONS.format(language=LANGUAGE_NAMES[self._language]))
 
     async def _booking_line(self, notes: BookingNotes) -> str | None:
         """Books once the caller confirmed every detail; the line telling the model how it went."""
@@ -234,8 +287,33 @@ class Receptionist(Agent):
             logger.info("reply truncated after the first question (%d chars dropped)", len(guard.dropped))
             self._tracker.add_event("truncation_net", f"{len(guard.dropped)} chars dropped after the first question")
 
+    async def tts_node(self, text: AsyncIterable[str], model_settings: ModelSettings) -> AsyncIterable[rtc.AudioFrame]:
+        """Speaks each reply in the language it is written in (Urdu script, Devanagari or Latin).
+        The TTS stream copies its options when it opens, so the language is set from the first
+        words of the reply before the stream starts; the rest streams through unchanged."""
+        head: list[str] = []
+        stream = aiter(text)
+        language = None
+        async for chunk in stream:
+            head.append(chunk)
+            if language := script_language("".join(head)):
+                break
+        if language and language != self._speech_language and self._speech is not None:
+            self._speech.update_options(language=language)  # type: ignore[attr-defined]
+            self._speech_language = language
+            self._tracker.add_event("speech_language", language)
+
+        async def replay() -> AsyncIterable[str]:
+            for chunk in head:
+                yield chunk
+            async for chunk in stream:
+                yield chunk
+
+        async for frame in Agent.default.tts_node(self, replay(), model_settings):
+            yield frame
+
     async def _announce_rate_limit_wait(self, stream: AsyncIterable[Any]) -> AsyncIterable[Any]:
-        """Passes the reply through, saying RATE_LIMIT_NOTICE first if its first chunk is held up by
+        """Passes the reply through, saying a RATE_LIMIT_NOTICE first if its first chunk is held up by
         a Groq rate-limit wait (groq_client waits out retry-after and retries once)."""
         hits = rate_limit.hits
         async with contextlib.aclosing(stream) as it:  # type: ignore[type-var]
@@ -248,7 +326,7 @@ class Receptionist(Agent):
                         announced = True
                         logger.warning("groq rate limit: waiting %.1fs before replying", wait)
                         self._tracker.add_event("rate_limited", f"groq 429, waiting {wait:.0f}s (retry-after)")
-                        yield RATE_LIMIT_NOTICE
+                        yield RATE_LIMIT_NOTICE[self._language]
             finally:
                 if not first.done():
                     # Let the cancelled read unwind before aclosing() closes the stream under it.

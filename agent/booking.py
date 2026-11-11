@@ -4,8 +4,12 @@ The model is bad at remembering which details it already has and at reading phon
 back, so code tracks both: which detail each caller answer belongs to, and whether the phone
 number heard so far is complete and valid. The result is a short system note added to the
 context for the next reply only (it never enters the stored chat history).
+
+Callers and the agent may speak English, Urdu or Hindi: every text is matched in its glossed form
+(lang.gloss), where the Urdu and Hindi keywords these checks look for read as English.
 """
 
+import difflib
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time
@@ -22,6 +26,7 @@ from business_hours import (
     resolve_day,
     resolve_times,
 )
+from lang import gloss, romanize, skeleton
 from tenant import ServiceInfo, current_business
 
 # Words that make a number a clock time ("nine in the evening"), not a day of the month.
@@ -73,6 +78,8 @@ _FRUSTRATED = re.compile(
 )
 # The agent told the caller the booking went through.
 _CONFIRMED = re.compile(r"\b(is confirmed|are confirmed|booked and confirmed|you're booked|you are booked|is booked)\b")
+# The agent asked whether something is right ("Is that correct?", "क्या यह सही है?").
+_ASKS_CORRECT = re.compile(r"\b(correct|right)\b")
 # How to name each detail when asking for it again.
 _FIELD_WORDS = {"name": "name", "service": "service", "date": "preferred date", "time": "preferred time",
                 "phone": "phone number"}
@@ -80,6 +87,33 @@ _FIELD_WORDS = {"name": "name", "service": "service", "date": "preferred date", 
 
 def match_service(text: str, services: tuple[ServiceInfo, ...]) -> ServiceInfo | None:
     """The offered service the caller named ("a regular haircut" -> Haircut), or None."""
+    if (found := _match_service_words(text, services)) is not None:
+        return found
+    # Urdu and Hindi transcripts write English service names in their own script ("ہیئر کٹ", "हेयर कट"):
+    # compare the consonants of each run of words with the service's ("hrkt" ~ "hrkt").
+    if re.search(r"[\u0600-\u06FF\u0900-\u097F]", text):
+        return _match_service_sound(text, services)
+    return None
+
+
+def _match_service_sound(text: str, services: tuple[ServiceInfo, ...]) -> ServiceInfo | None:
+    said = text.split()
+    best, best_score = None, 0.0
+    for service in services:
+        target = skeleton(service.name)
+        if len(target) < 2:
+            continue
+        size = max(1, len(service.name.split()))
+        for n in {size, size + 1, max(1, size - 1)}:
+            for i in range(max(1, len(said) - n + 1)):
+                window = skeleton(" ".join(said[i:i + n]))
+                score = difflib.SequenceMatcher(None, window, target).ratio() if window else 0.0
+                if score > best_score:
+                    best, best_score = service, score
+    return best if best_score >= 0.75 else None
+
+
+def _match_service_words(text: str, services: tuple[ServiceInfo, ...]) -> ServiceInfo | None:
     said = set(_words(_normalize(text)))
     best, best_score = None, 0
     for service in services:
@@ -96,10 +130,12 @@ def match_service(text: str, services: tuple[ServiceInfo, ...]) -> ServiceInfo |
 
 
 def clean_name(text: str) -> str:
-    """'My name is alex.' -> 'Alex'."""
+    """'My name is alex.' -> 'Alex'; 'मेरा नाम अहमद है' -> 'Ahmad' (in Latin letters for the dashboard)."""
     name = _NAME_LEAD_IN.sub("", _normalize(text)).strip(" .,!?")
     name = re.sub(r"^(yes|yeah|sure|okay|ok),?\s+", "", name)
+    name = re.sub(r"\s+(yes|okay|sure)$", "", name)  # "अहमद जी": the respectful "ji" is not part of the name
     name = _NAME_LEAD_IN.sub("", name)
+    name = romanize(name)
     return " ".join(part.capitalize() for part in name.split()[:4]) or text.strip()
 
 
@@ -127,7 +163,7 @@ _SPOKEN = {d: w for w, d in _DIGIT_WORDS.items() if w not in ("oh", "o")}
 
 
 def _normalize(text: str) -> str:
-    return text.lower().replace("’", "'").strip()
+    return gloss(text)
 
 
 def extract_digits(text: str) -> tuple[str, bool]:
@@ -276,7 +312,7 @@ class BookingNotes:
             self.awaiting = asked = [refused_before]
             if _ACK_ONLY.match(said.strip(" .!")):
                 return  # a plain "yes": the agent simply asks for that detail again
-        elif asked and bare_no and "correct" not in agent_text:
+        elif asked and bare_no and not _ASKS_CORRECT.search(agent_text):
             if _BOOKING_INTENT.search(agent_text) or re.search(r"\b(continue|go ahead|proceed)\b", agent_text):
                 self.declined = True  # "No" to "Would you like to continue booking?"
                 self.awaiting = []
@@ -285,7 +321,7 @@ class BookingNotes:
             return
 
         # A read-back of the number was answered.
-        if self.phone_check and self.phone_check.valid and not self.phone_confirmed and "correct" in agent_text:
+        if self.phone_check and self.phone_check.valid and not self.phone_confirmed and _ASKS_CORRECT.search(agent_text):
             if not _DENIAL.match(said):
                 self.phone_confirmed = bool(said)
                 return
@@ -482,8 +518,9 @@ class BookingNotes:
             )
         if self.phone_check and not self.phone_confirmed:
             return (
-                f"Read the phone number back exactly like this, digit by digit: \"{self.phone_check.spoken}\", "
-                "and ask if it is correct. Never say it as a formatted number."
+                f"Read the phone number back exactly like this, digit by digit: \"{self.phone_check.spoken}\" "
+                f"(digits {' '.join(self.phone_check.digits)}; when speaking Urdu or Hindi, say each digit in that "
+                "language), and ask if it is correct. Never say it as a formatted number."
             )
         if self.phone_digits and not self.phone_check:
             return (
