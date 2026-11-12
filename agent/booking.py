@@ -16,6 +16,7 @@ from datetime import datetime, time
 
 from livekit.agents.llm import ChatItem, ChatMessage
 
+import conduct
 from business_hours import (
     DAY_OR_TIME_WORDS,
     business_now,
@@ -64,6 +65,8 @@ _BOOKING_INTENT = re.compile(r"\b(book|booking|appointment|schedule|reserve|hair
 _BARE_NO = re.compile(r"^(?:(?:no|nope|nah|nahi|nahin)\s*)+$")
 # Lead-ins before a name ("my name is ...", "this is ...").
 _NAME_LEAD_IN = re.compile(r"^(?:(?:my name is|my name's|name is|this is|it's|it is|i am|i'm|call me)\s+)")
+# A name given while upset ("I said my name is Alex!").
+_UPSET_NAME = re.compile(r"^(?:my name is|my name's|name is|call me)\s+")
 # The caller is asking something ("How many services do you have?", "Who are you?").
 _QUESTION_START = re.compile(
     r"^(?:i said,? |i asked,? |but |so |and |okay,? |ok,? |wait,? )*"
@@ -232,6 +235,8 @@ class BookingNotes:
     refused_field: str | None = None  # the caller just said a bare "no" when asked for this detail
     caller_question: bool = False  # the caller's latest reply was a question, not an answer
     frustrated: bool = False  # the caller's latest reply sounded upset with the agent
+    misconduct: str | None = None  # the caller's latest reply was abusive or sexual (conduct.py)
+    misconduct_count: int = 0  # how many such replies on this call
     summarized: bool = False  # the agent already told the caller the booking is confirmed
     time_value: time | None = None  # the accepted appointment time
     service: ServiceInfo | None = None  # the business's service the caller chose
@@ -278,8 +283,15 @@ class BookingNotes:
         self.problem = None
 
         refused_before, self.refused_field = self.refused_field, None
-        self.frustrated = bool(_FRUSTRATED.search(said))
         self.caller_question = False
+        # Swearing at the agent or sexual talk: nothing in it is a detail, and conduct.py decides the reply.
+        self.misconduct = conduct.classify(user_text)
+        if self.misconduct:
+            self.misconduct_count += 1
+            self.frustrated = False
+            self.non_answer = None
+            return
+        self.frustrated = bool(_FRUSTRATED.search(said))
 
         # A greeting, line check or "sorry, what?" answers nothing: record nothing, keep waiting.
         self.non_answer = _non_answer(said)
@@ -363,7 +375,8 @@ class BookingNotes:
         for f in asked:
             if f not in ("phone", "date", "time") and f not in self.collected and said:
                 # An angry reply ("You are so disgusting") is not a detail; "I said my name is Alex!" still is.
-                if self.frustrated and not (f == "name" and _NAME_LEAD_IN.match(re.sub(r"^i (already )?(said|told you),? ", "", said))):
+                # ("This is useless" starts like "This is Alex", so an upset reply needs an explicit "my name is".)
+                if self.frustrated and not (f == "name" and _UPSET_NAME.match(re.sub(r"^i (already )?(said|told you),? ", "", said))):
                     continue
                 if f == "name" and _BOOKING_INTENT.search(said):
                     continue  # "I want to book a haircut" answers what they want, not their name
@@ -432,7 +445,8 @@ class BookingNotes:
     def render(self) -> str | None:
         """The note for the model, or None when there is nothing booking-related yet."""
         if not (self.collected or self.phone_digits or self.phone_check or self.acknowledged_field or self.problem
-                or self.non_answer or self.declined or self.refused_field or self.frustrated or self.caller_question):
+                or self.non_answer or self.declined or self.refused_field or self.frustrated or self.caller_question
+                or self.misconduct):
             return None
         lines = ["Call notes from the system (the caller cannot see these):"]
         given = [f"{f}: \"{v}\"" for f, v in self.collected.items() if f != "phone"]
@@ -442,8 +456,8 @@ class BookingNotes:
             lines.append("Already collected (do not ask again): " + "; ".join(given) + ".")
         missing = [f for f in FIELDS if f not in self.collected]
         instruction = self._instruction()
-        if self.declined:
-            pass  # no booking details are asked for after the caller said no
+        if self.declined or self.misconduct:
+            pass  # no booking details are asked for after the caller said no, or while they are abusive
         elif missing:
             # A specific instruction below (wait, read back, ask again) takes priority over asking.
             lines.append("Still needed: " + ", ".join(missing) + ("." if instruction else ". Ask only for the first one, after responding to anything else the caller just said."))
@@ -454,6 +468,9 @@ class BookingNotes:
         return "\n".join(lines)
 
     def _instruction(self) -> str | None:
+        if self.misconduct:
+            business = current_business.get()
+            return conduct.instruction(self.misconduct, self.misconduct_count, business.name if business else "this business")
         if self.frustrated:
             return (
                 "The caller is upset with you. Apologize sincerely in your own words and show you understood what "
